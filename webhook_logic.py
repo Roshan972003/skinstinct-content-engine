@@ -71,16 +71,24 @@ def news_candidate_from_row(row: dict) -> NewsCandidate | None:
     )
 
 
+def render_citation(news: NewsCandidate) -> str:
+    return f"NEWS SOURCE: {news.title}\nFROM: {news.source} {news.published}\nLINK: {news.link}"
+
+
 def render_message(score: int | None, draft_text: str, news_used: bool, news: NewsCandidate | None) -> str:
     score_label = f"Score: {score}/10" if score is not None else "Score: n/a"
     text = f"{score_label}\n\n{draft_text}"
     if news_used and news:
-        text += (
-            f"\n\nNEWS SOURCE: {news.title}\n"
-            f"FROM: {news.source} {news.published}\n"
-            f"LINK: {news.link}\n\n"
-            "▲ Check this before publishing — you are the author of this claim."
-        )
+        text += f"\n\n{render_citation(news)}\n\n▲ Check this before publishing — you are the author of this claim."
+    return text
+
+
+def render_final_copy(draft_text: str, news_used: bool, news: NewsCandidate | None) -> str:
+    """The clean, publish-ready text sent as its own message on Approve — no
+    score header, no internal review warning, just what she'd actually post."""
+    text = draft_text
+    if news_used and news:
+        text += f"\n\n{render_citation(news)}"
     return text
 
 
@@ -182,6 +190,8 @@ def finalize_decision(db: SupabaseClient, model: ModelAdapter, row: dict, action
         file_url = github_client.commit_markdown_file(path, content, message=f"Add {row.get('format')} post {timestamp}")
         if message_id:
             edit_message_text(chat_id, message_id, f"{original_text}\n\n---\n✅ Approved & archived: {file_url}")
+        final_copy = render_final_copy(row.get("draft_text") or "", bool(row.get("news_used")), news)
+        send_message(f"✅ Final copy — ready to post:\n\n{final_copy}", chat_id=chat_id)
         db.delete("pending_items", match={"id": row["id"]})
         return "Approved & archived"
 
