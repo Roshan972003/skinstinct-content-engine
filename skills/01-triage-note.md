@@ -28,11 +28,18 @@ post, and say why in one or two sentences.
   is `SKIP` with reason `duplicate`.
 - Never claim a note is stronger evidence than it is (e.g. do not describe a
   two-line fragment as "a strong story" if it has no concrete detail).
+- SCORE reflects only how developable the note is as-is (concreteness,
+  brand fit, non-duplication) — never inflate it to justify a DEVELOP
+  verdict, and never deflate a genuinely strong note to justify a SKIP.
+  A thin/vague/duplicate note should score low (1-3) even if the verdict
+  logic elsewhere is being lenient; a concrete, on-brand, non-duplicate
+  note should score high (7-10).
 
 ## SHAPE
 Return exactly this structure (plain text, one field per line):
 ```
 VERDICT: DEVELOP | SKIP
+SCORE: <integer 1-10, how developable this note is>
 REASON: <one or two sentences, plain language, no hedging filler>
 THEME: <short topic label, e.g. "pH transparency" or "ceramide barrier">
 OVERLAPS_WITH: <theme it duplicates, or "none">

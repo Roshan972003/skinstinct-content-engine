@@ -10,6 +10,7 @@ create table if not exists notes (
   text text not null,
   captured_at timestamptz not null default now(),
   verdict text,
+  score int check (score between 1 and 10),
   reason text,
   theme text,
   overlaps_with text,

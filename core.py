@@ -39,7 +39,7 @@ def parse_fields(text: str) -> dict:
     for line in text.splitlines():
         m = re.match(r"^([A-Z_]+):\s*(.*)$", line)
         if m and m.group(1) in {
-            "VERDICT", "REASON", "THEME", "OVERLAPS_WITH", "CONFIDENCE",
+            "VERDICT", "SCORE", "REASON", "THEME", "OVERLAPS_WITH", "CONFIDENCE",
             "DRAFT", "RATIONALE", "CLAIMS_LEDGER", "NEWS_USED",
         }:
             if current_key:

@@ -44,6 +44,15 @@ DECISION_WORDS = {"APPROVE": "approved", "REJECT": "rejected"}
 CALLBACK_ACTIONS = {"approve": "approved", "reject": "rejected"}
 
 
+def parse_score(raw: str | None) -> int | None:
+    if not raw:
+        return None
+    try:
+        return max(1, min(10, int(raw.strip().split()[0])))
+    except (ValueError, IndexError):
+        return None
+
+
 def get_known_themes(db: SupabaseClient, limit: int = 50) -> list[str]:
     rows = db.select("notes", order="created_at.desc", limit=limit, select="theme")
     return [r["theme"] for r in rows if r.get("theme")]
@@ -90,12 +99,14 @@ def handle_new_note(db: SupabaseClient, chat_id: int, message_id: int, text: str
 
     triage = run_triage(model, text, known_themes, static_context)
     verdict = (triage.get("VERDICT") or "").strip().upper()
+    score = parse_score(triage.get("SCORE"))
 
     db.update(
         "notes",
         match={"id": note["id"]},
         fields={
             "verdict": verdict or None,
+            "score": score,
             "reason": triage.get("REASON"),
             "theme": triage.get("THEME"),
             "overlaps_with": triage.get("OVERLAPS_WITH"),
@@ -105,9 +116,11 @@ def handle_new_note(db: SupabaseClient, chat_id: int, message_id: int, text: str
         },
     )
 
+    score_label = f"Score: {score}/10" if score is not None else "Score: n/a"
+
     if verdict != "DEVELOP":
         send_message(
-            f"Skipped: {triage.get('REASON', '(no reason given)')}",
+            f"{score_label}\nSkipped: {triage.get('REASON', '(no reason given)')}",
             chat_id=chat_id,
         )
         return
@@ -129,7 +142,7 @@ def handle_new_note(db: SupabaseClient, chat_id: int, message_id: int, text: str
     )
 
     sent = send_message(
-        draft.get("DRAFT", "(model returned no draft text)"),
+        f"{score_label}\n\n{draft.get('DRAFT', '(model returned no draft text)')}",
         chat_id=chat_id,
         reply_markup=approve_reject_keyboard(draft_row["id"]),
     )
