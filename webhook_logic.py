@@ -1,5 +1,7 @@
 """
-Telegram webhook entrypoint (Vercel Python serverless function).
+Telegram webhook handler logic. Framework-agnostic (takes headers + raw
+body, returns a (dict, status) pair) so it can be wired up from Flask
+(app.py) or tested directly without spinning up a server.
 
 Flow:
   channel_post (new note, no reply_to_message)
@@ -26,15 +28,11 @@ import os
 import sys
 import traceback
 from datetime import datetime, timezone
-from http.server import BaseHTTPRequestHandler
-from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-from adapters.model_adapter import ModelAdapter  # noqa: E402
-from core import build_static_context, run_draft, run_triage  # noqa: E402
-from lib.supabase_client import SupabaseClient, SupabaseError  # noqa: E402
-from lib.telegram_client import TelegramError, send_message  # noqa: E402
+from adapters.model_adapter import ModelAdapter
+from core import build_static_context, run_draft, run_triage
+from lib.supabase_client import SupabaseClient, SupabaseError
+from lib.telegram_client import TelegramError, send_message
 
 DECISION_WORDS = {"APPROVE": "approved", "REJECT": "rejected"}
 
@@ -135,52 +133,38 @@ def handle_new_note(db: SupabaseClient, chat_id: int, message_id: int, text: str
     )
 
 
-class handler(BaseHTTPRequestHandler):
-    def do_POST(self):
-        expected_secret = os.environ.get("TELEGRAM_WEBHOOK_SECRET")
-        got_secret = self.headers.get("X-Telegram-Bot-Api-Secret-Token")
-        if expected_secret and got_secret != expected_secret:
-            self._respond(401, {"ok": False, "error": "bad secret token"})
-            return
+def handle(headers, raw_body: bytes) -> tuple[dict, int]:
+    expected_secret = os.environ.get("TELEGRAM_WEBHOOK_SECRET")
+    got_secret = headers.get("X-Telegram-Bot-Api-Secret-Token")
+    if expected_secret and got_secret != expected_secret:
+        return {"ok": False, "error": "bad secret token"}, 401
 
-        length = int(self.headers.get("Content-Length", 0))
-        raw_body = self.rfile.read(length) if length else b"{}"
-        try:
-            update = json.loads(raw_body or b"{}")
-        except json.JSONDecodeError:
-            self._respond(400, {"ok": False, "error": "invalid json"})
-            return
+    try:
+        update = json.loads(raw_body or b"{}")
+    except json.JSONDecodeError:
+        return {"ok": False, "error": "invalid json"}, 400
 
-        # Known trap: channel posts arrive as `channel_post`, not `message`.
-        message = update.get("channel_post") or update.get("message")
-        if not message or "text" not in message:
-            self._respond(200, {"ok": True, "skipped": "no message/channel_post text"})
-            return
+    # Known trap: channel posts arrive as `channel_post`, not `message`.
+    message = update.get("channel_post") or update.get("message")
+    if not message or "text" not in message:
+        return {"ok": True, "skipped": "no message/channel_post text"}, 200
 
-        chat_id = message["chat"]["id"]
-        allowed_chat_id = os.environ.get("TELEGRAM_CHAT_ID")
-        if allowed_chat_id and str(chat_id) != str(allowed_chat_id):
-            self._respond(200, {"ok": True, "skipped": "chat_id not the configured capture channel"})
-            return
+    chat_id = message["chat"]["id"]
+    allowed_chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    if allowed_chat_id and str(chat_id) != str(allowed_chat_id):
+        return {"ok": True, "skipped": "chat_id not the configured capture channel"}, 200
 
-        try:
-            db = SupabaseClient()
-            reply_to = message.get("reply_to_message")
-            if reply_to:
-                handle_decision(db, reply_to["message_id"], message["text"])
-            else:
-                handle_new_note(db, chat_id, message["message_id"], message["text"])
-            self._respond(200, {"ok": True})
-        except (SupabaseError, TelegramError) as exc:
-            print(f"webhook error: {exc}", file=sys.stderr)
-            self._respond(200, {"ok": False, "error": str(exc)})
-        except Exception:
-            print(traceback.format_exc(), file=sys.stderr)
-            self._respond(200, {"ok": False, "error": "internal error, see logs"})
-
-    def _respond(self, status: int, body: dict) -> None:
-        payload = json.dumps(body).encode()
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.end_headers()
-        self.wfile.write(payload)
+    try:
+        db = SupabaseClient()
+        reply_to = message.get("reply_to_message")
+        if reply_to:
+            handle_decision(db, reply_to["message_id"], message["text"])
+        else:
+            handle_new_note(db, chat_id, message["message_id"], message["text"])
+        return {"ok": True}, 200
+    except (SupabaseError, TelegramError) as exc:
+        print(f"webhook error: {exc}", file=sys.stderr)
+        return {"ok": False, "error": str(exc)}, 200
+    except Exception:
+        print(traceback.format_exc(), file=sys.stderr)
+        return {"ok": False, "error": "internal error, see logs"}, 200
