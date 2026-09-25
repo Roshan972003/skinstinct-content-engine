@@ -32,9 +32,16 @@ from datetime import datetime, timezone
 from adapters.model_adapter import ModelAdapter
 from core import build_static_context, run_draft, run_triage
 from lib.supabase_client import SupabaseClient, SupabaseError
-from lib.telegram_client import TelegramError, send_message
+from lib.telegram_client import (
+    TelegramError,
+    answer_callback_query,
+    approve_reject_keyboard,
+    edit_message_text,
+    send_message,
+)
 
 DECISION_WORDS = {"APPROVE": "approved", "REJECT": "rejected"}
+CALLBACK_ACTIONS = {"approve": "approved", "reject": "rejected"}
 
 
 def get_known_themes(db: SupabaseClient, limit: int = 50) -> list[str]:
@@ -122,15 +129,48 @@ def handle_new_note(db: SupabaseClient, chat_id: int, message_id: int, text: str
     )
 
     sent = send_message(
-        f"{draft.get('DRAFT', '(model returned no draft text)')}\n\n"
-        "---\nReply APPROVE or REJECT to this message.",
+        draft.get("DRAFT", "(model returned no draft text)"),
         chat_id=chat_id,
+        reply_markup=approve_reject_keyboard(draft_row["id"]),
     )
     db.update(
         "drafts",
         match={"id": draft_row["id"]},
         fields={"telegram_reply_message_id": sent["message_id"]},
     )
+
+
+def handle_callback_query(db: SupabaseClient, callback_query: dict) -> None:
+    data = callback_query.get("data", "")
+    action, _, draft_id = data.partition(":")
+    status = CALLBACK_ACTIONS.get(action)
+    if not status or not draft_id:
+        answer_callback_query(callback_query["id"], "Unrecognized action")
+        return
+
+    drafts = db.select("drafts", match={"id": draft_id})
+    if not drafts:
+        answer_callback_query(callback_query["id"], "Draft not found")
+        return
+    draft = drafts[0]
+
+    db.update(
+        "drafts",
+        match={"id": draft_id},
+        fields={"status": status, "decided_at": datetime.now(timezone.utc).isoformat()},
+    )
+
+    label = "✅ Approved" if status == "approved" else "❌ Rejected"
+    message = callback_query.get("message", {})
+    chat_id = message.get("chat", {}).get("id")
+    message_id = message.get("message_id")
+    if chat_id and message_id:
+        edit_message_text(
+            chat_id,
+            message_id,
+            f"{draft.get('draft_text', '')}\n\n---\n{label}",
+        )
+    answer_callback_query(callback_query["id"], label)
 
 
 def handle(headers, raw_body: bytes) -> tuple[dict, int]:
@@ -143,6 +183,18 @@ def handle(headers, raw_body: bytes) -> tuple[dict, int]:
         update = json.loads(raw_body or b"{}")
     except json.JSONDecodeError:
         return {"ok": False, "error": "invalid json"}, 400
+
+    callback_query = update.get("callback_query")
+    if callback_query:
+        try:
+            handle_callback_query(SupabaseClient(), callback_query)
+            return {"ok": True}, 200
+        except (SupabaseError, TelegramError) as exc:
+            print(f"webhook error: {exc}", file=sys.stderr)
+            return {"ok": False, "error": str(exc)}, 200
+        except Exception:
+            print(traceback.format_exc(), file=sys.stderr)
+            return {"ok": False, "error": "internal error, see logs"}, 200
 
     # Known trap: channel posts arrive as `channel_post`, not `message`.
     message = update.get("channel_post") or update.get("message")
