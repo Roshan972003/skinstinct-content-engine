@@ -1,11 +1,8 @@
 """
-Shared triage/draft logic for the live webhook pipeline (api/webhook.py).
+Shared score/draft logic for the live webhook pipeline (webhook_logic.py).
 
-Reuses the same skill prompts and context files as the local demo pipeline
-(pipeline.py) — the node contracts don't change just because notes now
-arrive over Telegram/Supabase instead of local files. Deliberately kept as
-plain functions (no framework) so a Vercel serverless function can import
-this module directly.
+Deliberately kept as plain functions (no framework) so a Vercel serverless
+function can import this module directly.
 """
 from __future__ import annotations
 
@@ -13,12 +10,13 @@ import re
 from pathlib import Path
 
 from adapters.model_adapter import ModelAdapter
-from adapters.news_adapter import fetch_news_candidates
 
 ROOT = Path(__file__).parent
 CONTEXT_DIR = ROOT / "context"
 SKILLS_DIR = ROOT / "skills"
 VOICE_FILE = ROOT / "voice-skill.txt"
+
+FIELD_NAMES = {"SCORE", "REASON", "NEWS_QUERY", "DRAFT", "NEWS_USED"}
 
 
 def read(path: Path) -> str:
@@ -38,10 +36,7 @@ def parse_fields(text: str) -> dict:
     buffer: list[str] = []
     for line in text.splitlines():
         m = re.match(r"^([A-Z_]+):\s*(.*)$", line)
-        if m and m.group(1) in {
-            "VERDICT", "SCORE", "REASON", "THEME", "OVERLAPS_WITH", "CONFIDENCE",
-            "DRAFT", "RATIONALE", "CLAIMS_LEDGER", "NEWS_USED",
-        }:
+        if m and m.group(1) in FIELD_NAMES:
             if current_key:
                 fields[current_key] = "\n".join(buffer).strip()
             current_key = m.group(1)
@@ -53,13 +48,9 @@ def parse_fields(text: str) -> dict:
     return fields
 
 
-def run_triage(model: ModelAdapter, note_text: str, known_themes: list[str], static_context: str) -> dict:
-    node_prompt = read(SKILLS_DIR / "01-triage-note.md")
-    prompt = (
-        f"{node_prompt}\n\n"
-        f"KNOWN_THEMES:\n{chr(10).join(known_themes) or '(none yet)'}\n\n"
-        f"NOTE:\n{note_text}"
-    )
+def run_score(model: ModelAdapter, note_text: str, static_context: str) -> dict:
+    node_prompt = read(SKILLS_DIR / "01-score-note.md")
+    prompt = f"{node_prompt}\n\nNOTE:\n{note_text}"
     response = model.generate(static_context, prompt)
     fields = parse_fields(response.text)
     fields["_mocked"] = response.mocked
@@ -67,22 +58,31 @@ def run_triage(model: ModelAdapter, note_text: str, known_themes: list[str], sta
     return fields
 
 
-def run_draft(model: ModelAdapter, note_text: str, triage: dict, static_context: str) -> dict:
+def run_draft(
+    model: ModelAdapter,
+    note_text: str,
+    news_candidate,
+    format_: str,
+    static_context: str,
+) -> dict:
     node_prompt = read(SKILLS_DIR / "02-draft-post.md")
-    news = fetch_news_candidates(triage.get("THEME", ""))
-    news_block = (
-        "\n".join(f"- {c.title} — {c.source}, {c.published} ({c.link})" for c in news)
-        or "(no news candidates found — omit current angle, do not invent one)"
-    )
+    if news_candidate:
+        news_block = (
+            f"- {news_candidate.title} — {news_candidate.source}, "
+            f"{news_candidate.published} ({news_candidate.link})\n"
+            f"  Summary: {news_candidate.summary or '(none)'}"
+        )
+    else:
+        news_block = "(no news candidate found — omit current angle, do not invent one)"
+
     prompt = (
         f"{node_prompt}\n\n"
-        f"TRIAGE_VERDICT:\n{triage.get('_raw', '')}\n\n"
-        f"NEWS_CANDIDATES:\n{news_block}\n\n"
+        f"FORMAT: {format_}\n\n"
+        f"NEWS_CANDIDATE:\n{news_block}\n\n"
         f"NOTE:\n{note_text}"
     )
     response = model.generate(static_context, prompt)
     fields = parse_fields(response.text)
     fields["_mocked"] = response.mocked
     fields["_raw"] = response.text
-    fields["_news_count"] = len(news)
     return fields

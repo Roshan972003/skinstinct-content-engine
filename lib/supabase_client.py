@@ -1,8 +1,8 @@
 """
-Minimal Supabase REST (PostgREST) client — just enough for this app's three
-tables. Uses `requests` directly against `${SUPABASE_URL}/rest/v1/...`
-rather than the `supabase-py` package, to keep the Vercel function's
-dependency surface small.
+Minimal Supabase REST (PostgREST) client — just enough for this app's one
+pending-state table. Uses `requests` directly against
+`${SUPABASE_URL}/rest/v1/...` rather than the `supabase-py` package, to
+keep the Vercel function's dependency surface small.
 """
 from __future__ import annotations
 
@@ -69,3 +69,9 @@ class SupabaseClient:
         if not resp.ok:
             raise SupabaseError(f"select from {table} failed: {resp.status_code} {resp.text}")
         return resp.json()
+
+    def delete(self, table: str, match: dict[str, Any]) -> None:
+        params = {k: f"eq.{v}" for k, v in match.items()}
+        resp = requests.delete(f"{self.base}/{table}", headers=self.headers, params=params, timeout=TIMEOUT_SECONDS)
+        if not resp.ok:
+            raise SupabaseError(f"delete from {table} failed: {resp.status_code} {resp.text}")

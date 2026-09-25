@@ -50,10 +50,26 @@ def answer_callback_query(callback_query_id: str, text: str | None = None) -> di
     return _post("answerCallbackQuery", payload)
 
 
-def approve_reject_keyboard(draft_id: str) -> dict:
+def decision_keyboard(pending_id: str) -> dict:
     return {
         "inline_keyboard": [[
-            {"text": "✅ Approve", "callback_data": f"approve:{draft_id}"},
-            {"text": "❌ Reject", "callback_data": f"reject:{draft_id}"},
+            {"text": "✅ Approve & publish", "callback_data": f"approve:{pending_id}"},
+            {"text": "↻ Regenerate", "callback_data": f"regenerate:{pending_id}"},
+            {"text": "❌ Discard", "callback_data": f"discard:{pending_id}"},
         ]]
     }
+
+
+def get_telegram_file_path(file_id: str) -> str:
+    result = _post("getFile", {"file_id": file_id})
+    return result["file_path"]
+
+
+def download_telegram_file(file_path: str) -> bytes:
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    if not token:
+        raise TelegramError("TELEGRAM_BOT_TOKEN not configured")
+    resp = requests.get(f"https://api.telegram.org/file/bot{token}/{file_path}", timeout=TIMEOUT_SECONDS)
+    if not resp.ok:
+        raise TelegramError(f"file download failed: {resp.status_code}")
+    return resp.content

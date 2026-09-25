@@ -12,15 +12,18 @@ caller (Node 02 / draft-post) is required by its own rules to omit the
 """
 from __future__ import annotations
 
+import re
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional
 
 RSS_BASE = "https://news.google.com/rss/search"
 TIMEOUT_SECONDS = 6
 MAX_RESULTS = 3
+
+_TAG_RE = re.compile(r"<[^>]+>")
 
 
 @dataclass
@@ -29,6 +32,7 @@ class NewsCandidate:
     source: str
     published: str
     link: str
+    summary: str = ""
 
 
 def fetch_news_candidates(query: str) -> List[NewsCandidate]:
@@ -59,13 +63,27 @@ def fetch_news_candidates(query: str) -> List[NewsCandidate]:
         pub_date = (item.findtext("pubDate") or "").strip()
         source_el = item.find("source")
         source = (source_el.text or "").strip() if source_el is not None else ""
+        description = (item.findtext("description") or "").strip()
+        summary = _TAG_RE.sub("", description).strip()
 
         # Guardrail: only a candidate with all three of title/date/source
         # counts as "verified enough to cite." Anything partial is dropped
         # rather than passed through with a gap papered over.
         if title and link and pub_date:
             candidates.append(
-                NewsCandidate(title=title, source=source or "unspecified", published=pub_date, link=link)
+                NewsCandidate(
+                    title=title,
+                    source=source or "unspecified",
+                    published=pub_date,
+                    link=link,
+                    summary=summary,
+                )
             )
 
     return candidates
+
+
+def fetch_top_news(query: str) -> Optional[NewsCandidate]:
+    """Convenience wrapper: just the single best candidate, or None."""
+    candidates = fetch_news_candidates(query)
+    return candidates[0] if candidates else None

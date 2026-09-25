@@ -1,189 +1,234 @@
 """
-Telegram webhook handler logic. Framework-agnostic (takes headers + raw
-body, returns a (dict, status) pair) so it can be wired up from Flask
-(app.py) or tested directly without spinning up a server.
+Telegram bot entrypoint (Vercel Python serverless function, wired up by
+app.py). See DESIGN_BRIEF.md's successor spec for the full pipeline; in
+short:
 
-Flow:
-  channel_post (new note, no reply_to_message)
-    -> insert into `notes`
-    -> triage (Gemini) -> if DEVELOP, draft (Gemini + news)
-    -> insert into `drafts`
-    -> sendMessage back to the channel with the draft + "Reply APPROVE or
-       REJECT to this message" -> store that message's id so the reply can
-       be matched back to this draft
+  /linkedin <note> or /newsletter <note>, or a voice note (transcribed,
+  then asks which format) -> score gate (0-10) -> if >=6, news angle via
+  Google News RSS -> draft in Meera's voice -> posted with
+  Approve & publish / Regenerate / Discard buttons (or a plain
+  APPROVE/REJECT reply also works) -> Approve commits a dated markdown
+  file to a private GitHub archive repo; nothing else is ever persisted
+  once a draft is resolved.
 
-  channel_post with reply_to_message, text APPROVE/REJECT (case-insensitive)
-    -> look up the draft whose telegram_reply_message_id equals
-       reply_to_message.message_id -> flip its status
+`pending_items` in Supabase exists only to bridge Telegram's stateless
+webhook calls between requests (a transcript waiting for a format choice,
+a draft waiting for a decision) — rows are deleted as soon as they're
+resolved. The GitHub archive is the only permanent record.
 
-Every other update type (my_chat_member, edited_message, a plain private
-message to the bot, etc.) is acknowledged with 200 and otherwise ignored —
-Telegram retries a webhook that doesn't return 200, so failures must not be
-silently swallowed as "did nothing" without a 200 response.
+Known trap: channel posts arrive as `channel_post`, not `message`. Every
+update this handler doesn't recognize is acknowledged with 200 and
+otherwise ignored — Telegram retries a webhook that doesn't return 200,
+and the bot must not respond outside its configured channel.
 """
 from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import traceback
 from datetime import datetime, timezone
 
 from adapters.model_adapter import ModelAdapter
-from core import build_static_context, run_draft, run_triage
+from adapters.news_adapter import NewsCandidate, fetch_top_news
+from core import build_static_context, run_draft, run_score
+from lib import github_client
 from lib.supabase_client import SupabaseClient, SupabaseError
 from lib.telegram_client import (
     TelegramError,
     answer_callback_query,
-    approve_reject_keyboard,
+    decision_keyboard,
+    download_telegram_file,
     edit_message_text,
+    get_telegram_file_path,
     send_message,
 )
 
-DECISION_WORDS = {"APPROVE": "approved", "REJECT": "rejected"}
-CALLBACK_ACTIONS = {"approve": "approved", "reject": "rejected"}
+SCORE_THRESHOLD = 6
+FORMAT_COMMAND_RE = re.compile(r"^/(linkedin|newsletter)\b\s*(.*)$", re.IGNORECASE | re.DOTALL)
+BARE_FORMAT_RE = re.compile(r"^/?(linkedin|newsletter)$", re.IGNORECASE)
 
 
 def parse_score(raw: str | None) -> int | None:
     if not raw:
         return None
     try:
-        return max(1, min(10, int(raw.strip().split()[0])))
+        return max(0, min(10, int(raw.strip().split()[0])))
     except (ValueError, IndexError):
         return None
 
 
-def get_known_themes(db: SupabaseClient, limit: int = 50) -> list[str]:
-    rows = db.select("notes", order="created_at.desc", limit=limit, select="theme")
-    return [r["theme"] for r in rows if r.get("theme")]
-
-
-def get_voice_skill_override(db: SupabaseClient) -> str | None:
-    try:
-        rows = db.select("voice_skill", match={"id": 1}, select="content")
-        return rows[0]["content"] if rows else None
-    except SupabaseError:
+def news_candidate_from_row(row: dict) -> NewsCandidate | None:
+    if not row.get("news_headline"):
         return None
-
-
-def handle_decision(db: SupabaseClient, reply_to_message_id: int, decision_text: str) -> None:
-    word = decision_text.strip().upper()
-    status = DECISION_WORDS.get(word)
-    if not status:
-        return  # a reply that isn't literally APPROVE/REJECT — leave the draft pending
-
-    drafts = db.select("drafts", match={"telegram_reply_message_id": reply_to_message_id})
-    if not drafts:
-        return  # reply to something that isn't a tracked draft message
-
-    db.update(
-        "drafts",
-        match={"id": drafts[0]["id"]},
-        fields={"status": status, "decided_at": datetime.now(timezone.utc).isoformat()},
+    return NewsCandidate(
+        title=row["news_headline"],
+        source=row.get("news_source") or "unspecified",
+        published=row.get("news_published") or "",
+        link=row.get("news_link") or "",
+        summary=row.get("news_summary") or "",
     )
 
 
-def handle_new_note(db: SupabaseClient, chat_id: int, message_id: int, text: str) -> None:
-    note = db.insert(
-        "notes",
-        {
-            "telegram_message_id": message_id,
-            "telegram_chat_id": chat_id,
-            "text": text,
-        },
-    )
-
-    model = ModelAdapter()
-    static_context = build_static_context(get_voice_skill_override(db))
-    known_themes = get_known_themes(db)
-
-    triage = run_triage(model, text, known_themes, static_context)
-    verdict = (triage.get("VERDICT") or "").strip().upper()
-    score = parse_score(triage.get("SCORE"))
-
-    db.update(
-        "notes",
-        match={"id": note["id"]},
-        fields={
-            "verdict": verdict or None,
-            "score": score,
-            "reason": triage.get("REASON"),
-            "theme": triage.get("THEME"),
-            "overlaps_with": triage.get("OVERLAPS_WITH"),
-            "confidence": triage.get("CONFIDENCE"),
-            "model_mocked": bool(triage.get("_mocked")),
-            "raw_triage_response": triage.get("_raw"),
-        },
-    )
-
+def render_message(score: int | None, draft_text: str, news_used: bool, news: NewsCandidate | None) -> str:
     score_label = f"Score: {score}/10" if score is not None else "Score: n/a"
-
-    if verdict != "DEVELOP":
-        send_message(
-            f"{score_label}\nSkipped: {triage.get('REASON', '(no reason given)')}",
-            chat_id=chat_id,
+    text = f"{score_label}\n\n{draft_text}"
+    if news_used and news:
+        text += (
+            f"\n\nNEWS SOURCE: {news.title}\n"
+            f"FROM: {news.source} {news.published}\n"
+            f"LINK: {news.link}\n\n"
+            "▲ Check this before publishing — you are the author of this claim."
         )
+    return text
+
+
+def run_pipeline(db: SupabaseClient, model: ModelAdapter, chat_id: int, format_: str, note_text: str) -> None:
+    static_context = build_static_context()
+    score_result = run_score(model, note_text, static_context)
+    score = parse_score(score_result.get("SCORE"))
+    reason = score_result.get("REASON", "") or "(no reason given)"
+
+    if score is None or score < SCORE_THRESHOLD:
+        score_label = f"Score: {score}/10" if score is not None else "Score: n/a"
+        send_message(f"{score_label}\n{reason}", chat_id=chat_id)
         return
 
-    draft = run_draft(model, text, triage, static_context)
-    draft_row = db.insert(
-        "drafts",
+    news_query = (score_result.get("NEWS_QUERY") or "").strip()
+    news = fetch_top_news(news_query) if news_query else None
+
+    draft_result = run_draft(model, note_text, news, format_, static_context)
+    draft_text = draft_result.get("DRAFT", "(model returned no draft text)")
+    news_used = news is not None and (draft_result.get("NEWS_USED") or "").strip().lower() == "yes"
+
+    row = db.insert(
+        "pending_items",
         {
-            "note_id": note["id"],
-            "draft_text": draft.get("DRAFT"),
-            "rationale": draft.get("RATIONALE"),
-            "claims_ledger": draft.get("CLAIMS_LEDGER"),
-            "news_used": draft.get("NEWS_USED"),
-            "news_candidate_count": draft.get("_news_count", 0),
-            "model_mocked": bool(draft.get("_mocked")),
-            "raw_draft_response": draft.get("_raw"),
+            "stage": "awaiting_decision",
+            "format": format_,
+            "note_text": note_text,
+            "score": score,
+            "score_reason": reason,
+            "news_query": news_query or None,
+            "news_headline": news.title if news else None,
+            "news_source": news.source if news else None,
+            "news_published": news.published if news else None,
+            "news_link": news.link if news else None,
+            "news_summary": news.summary if news else None,
+            "draft_text": draft_text,
+            "news_used": news_used,
             "telegram_chat_id": chat_id,
         },
     )
 
+    text = render_message(score, draft_text, news_used, news)
+    sent = send_message(text, chat_id=chat_id, reply_markup=decision_keyboard(row["id"]))
+    db.update("pending_items", match={"id": row["id"]}, fields={"telegram_message_id": sent["message_id"]})
+
+
+def handle_voice(db: SupabaseClient, model: ModelAdapter, chat_id: int, message: dict) -> None:
+    file_id = message["voice"]["file_id"]
+    file_path = get_telegram_file_path(file_id)
+    audio_bytes = download_telegram_file(file_path)
+    transcript = model.transcribe(audio_bytes, mime_type="audio/ogg")
+
+    if transcript.mocked:
+        send_message(f"Couldn't transcribe that voice note.\n\n{transcript.text}", chat_id=chat_id)
+        return
+
     sent = send_message(
-        f"{score_label}\n\n{draft.get('DRAFT', '(model returned no draft text)')}",
+        f"Transcribed:\n\n{transcript.text}\n\nReply with /linkedin or /newsletter to draft this.",
         chat_id=chat_id,
-        reply_markup=approve_reject_keyboard(draft_row["id"]),
     )
-    db.update(
-        "drafts",
-        match={"id": draft_row["id"]},
-        fields={"telegram_reply_message_id": sent["message_id"]},
+    db.insert(
+        "pending_items",
+        {
+            "stage": "awaiting_format",
+            "note_text": transcript.text,
+            "telegram_chat_id": chat_id,
+            "telegram_message_id": sent["message_id"],
+        },
     )
 
 
-def handle_callback_query(db: SupabaseClient, callback_query: dict) -> None:
+def handle_format_reply(db: SupabaseClient, model: ModelAdapter, chat_id: int, reply_to_message_id: int, format_: str) -> None:
+    rows = db.select(
+        "pending_items",
+        match={"stage": "awaiting_format", "telegram_message_id": reply_to_message_id, "telegram_chat_id": chat_id},
+    )
+    if not rows:
+        return
+    note_text = rows[0]["note_text"]
+    db.delete("pending_items", match={"id": rows[0]["id"]})
+    run_pipeline(db, model, chat_id, format_, note_text)
+
+
+def finalize_decision(db: SupabaseClient, model: ModelAdapter, row: dict, action: str) -> str:
+    """action is one of approve / discard / regenerate. Returns a short status string."""
+    chat_id = row["telegram_chat_id"]
+    message_id = row.get("telegram_message_id")
+    news = news_candidate_from_row(row)
+    original_text = render_message(row.get("score"), row.get("draft_text") or "", bool(row.get("news_used")), news)
+
+    if action == "approve":
+        github_client.ensure_repo_exists()
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        path = f"{row.get('format') or 'post'}/{timestamp}.md"
+        content = (
+            f"# {(row.get('format') or 'post').capitalize()} post — {timestamp}\n\n"
+            f"{original_text}\n"
+        )
+        file_url = github_client.commit_markdown_file(path, content, message=f"Add {row.get('format')} post {timestamp}")
+        if message_id:
+            edit_message_text(chat_id, message_id, f"{original_text}\n\n---\n✅ Approved & archived: {file_url}")
+        db.delete("pending_items", match={"id": row["id"]})
+        return "Approved & archived"
+
+    if action == "discard":
+        if message_id:
+            edit_message_text(chat_id, message_id, f"{original_text}\n\n---\n❌ Discarded")
+        db.delete("pending_items", match={"id": row["id"]})
+        return "Discarded"
+
+    if action == "regenerate":
+        if message_id:
+            edit_message_text(chat_id, message_id, f"{original_text}\n\n---\n↻ Regenerating…")
+        db.delete("pending_items", match={"id": row["id"]})
+        run_pipeline(db, model, chat_id, row.get("format") or "linkedin", row["note_text"])
+        return "Regenerating"
+
+    return "Unrecognized action"
+
+
+def handle_callback_query(db: SupabaseClient, model: ModelAdapter, callback_query: dict) -> None:
     data = callback_query.get("data", "")
-    action, _, draft_id = data.partition(":")
-    status = CALLBACK_ACTIONS.get(action)
-    if not status or not draft_id:
+    action, _, pending_id = data.partition(":")
+    if action not in {"approve", "discard", "regenerate"} or not pending_id:
         answer_callback_query(callback_query["id"], "Unrecognized action")
         return
 
-    drafts = db.select("drafts", match={"id": draft_id})
-    if not drafts:
+    rows = db.select("pending_items", match={"id": pending_id, "stage": "awaiting_decision"})
+    if not rows:
         answer_callback_query(callback_query["id"], "Draft not found")
         return
-    draft = drafts[0]
 
-    db.update(
-        "drafts",
-        match={"id": draft_id},
-        fields={"status": status, "decided_at": datetime.now(timezone.utc).isoformat()},
+    status = finalize_decision(db, model, rows[0], action)
+    answer_callback_query(callback_query["id"], status)
+
+
+def handle_text_decision(db: SupabaseClient, model: ModelAdapter, chat_id: int, reply_to_message_id: int, text: str) -> None:
+    word = text.strip().upper()
+    action = {"APPROVE": "approve", "REJECT": "discard"}.get(word)
+    if not action:
+        return
+    rows = db.select(
+        "pending_items",
+        match={"stage": "awaiting_decision", "telegram_message_id": reply_to_message_id, "telegram_chat_id": chat_id},
     )
-
-    label = "✅ Approved" if status == "approved" else "❌ Rejected"
-    message = callback_query.get("message", {})
-    chat_id = message.get("chat", {}).get("id")
-    message_id = message.get("message_id")
-    if chat_id and message_id:
-        edit_message_text(
-            chat_id,
-            message_id,
-            f"{draft.get('draft_text', '')}\n\n---\n{label}",
-        )
-    answer_callback_query(callback_query["id"], label)
+    if not rows:
+        return
+    finalize_decision(db, model, rows[0], action)
 
 
 def handle(headers, raw_body: bytes) -> tuple[dict, int]:
@@ -197,37 +242,69 @@ def handle(headers, raw_body: bytes) -> tuple[dict, int]:
     except json.JSONDecodeError:
         return {"ok": False, "error": "invalid json"}, 400
 
-    callback_query = update.get("callback_query")
-    if callback_query:
-        try:
-            handle_callback_query(SupabaseClient(), callback_query)
-            return {"ok": True}, 200
-        except (SupabaseError, TelegramError) as exc:
-            print(f"webhook error: {exc}", file=sys.stderr)
-            return {"ok": False, "error": str(exc)}, 200
-        except Exception:
-            print(traceback.format_exc(), file=sys.stderr)
-            return {"ok": False, "error": "internal error, see logs"}, 200
-
     # Known trap: channel posts arrive as `channel_post`, not `message`.
     message = update.get("channel_post") or update.get("message")
-    if not message or "text" not in message:
-        return {"ok": True, "skipped": "no message/channel_post text"}, 200
+    callback_query = update.get("callback_query")
 
-    chat_id = message["chat"]["id"]
+    if not message and not callback_query:
+        return {"ok": True, "skipped": "no message/channel_post/callback_query"}, 200
+
     allowed_chat_id = os.environ.get("TELEGRAM_CHAT_ID")
-    if allowed_chat_id and str(chat_id) != str(allowed_chat_id):
+    source_chat_id = (
+        message["chat"]["id"] if message else callback_query.get("message", {}).get("chat", {}).get("id")
+    )
+    if allowed_chat_id and source_chat_id is not None and str(source_chat_id) != str(allowed_chat_id):
         return {"ok": True, "skipped": "chat_id not the configured capture channel"}, 200
+
+    # Figure out which (if any) action this update maps to before touching
+    # Supabase/Gemini, so an update that matches nothing costs nothing.
+    action = None
+    if callback_query:
+        action = ("callback", callback_query)
+    elif "voice" in message:
+        action = ("voice", message)
+    else:
+        text = message.get("text", "")
+        reply_to = message.get("reply_to_message")
+        bare_format = BARE_FORMAT_RE.match(text.strip()) if reply_to else None
+        command_match = FORMAT_COMMAND_RE.match(text.strip())
+
+        if reply_to and bare_format:
+            action = ("format_reply", message["chat"]["id"], reply_to["message_id"], bare_format.group(1).lower())
+        elif command_match and command_match.group(2).strip():
+            action = (
+                "command",
+                message["chat"]["id"],
+                command_match.group(1).lower(),
+                command_match.group(2).strip(),
+            )
+        elif reply_to and text.strip().upper() in {"APPROVE", "REJECT"}:
+            action = ("text_decision", message["chat"]["id"], reply_to["message_id"], text)
+
+    if action is None:
+        return {"ok": True, "skipped": "no recognized command"}, 200
 
     try:
         db = SupabaseClient()
-        reply_to = message.get("reply_to_message")
-        if reply_to:
-            handle_decision(db, reply_to["message_id"], message["text"])
-        else:
-            handle_new_note(db, chat_id, message["message_id"], message["text"])
+        model = ModelAdapter()
+        kind = action[0]
+
+        if kind == "callback":
+            handle_callback_query(db, model, action[1])
+        elif kind == "voice":
+            handle_voice(db, model, action[1]["chat"]["id"], action[1])
+        elif kind == "format_reply":
+            _, chat_id, reply_to_message_id, format_ = action
+            handle_format_reply(db, model, chat_id, reply_to_message_id, format_)
+        elif kind == "command":
+            _, chat_id, format_, note_text = action
+            run_pipeline(db, model, chat_id, format_, note_text)
+        elif kind == "text_decision":
+            _, chat_id, reply_to_message_id, text = action
+            handle_text_decision(db, model, chat_id, reply_to_message_id, text)
+
         return {"ok": True}, 200
-    except (SupabaseError, TelegramError) as exc:
+    except (SupabaseError, TelegramError, github_client.GitHubError) as exc:
         print(f"webhook error: {exc}", file=sys.stderr)
         return {"ok": False, "error": str(exc)}, 200
     except Exception:

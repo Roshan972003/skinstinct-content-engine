@@ -11,6 +11,9 @@ def check() -> tuple[dict, int]:
             "TELEGRAM_CHAT_ID",
             "SUPABASE_URL",
             "SUPABASE_SERVICE_ROLE_KEY",
+            "GITHUB_TOKEN",
+            "GITHUB_OWNER",
+            "GITHUB_ARCHIVE_REPO",
         )
         if not os.environ.get(var)
     ]

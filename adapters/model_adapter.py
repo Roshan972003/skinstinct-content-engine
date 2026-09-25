@@ -30,13 +30,10 @@ class ModelAdapter:
 
     def __init__(self):
         self.api_key = os.getenv("GEMINI_API_KEY")
-        # gemini-2.0-flash was retired by Google during development of this
-        # adapter (confirmed by a live 404 pointing here); gemini-3.6-flash
-        # is the replacement Google's own error message names, and matches
-        # the placeholder already present in this workspace's root
-        # .env.example. Still treat this as unconfirmed/overridable, not a
-        # hardcoded guarantee — override via GEMINI_MODEL if it changes again.
-        self.model_name = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+        # Prefer the `-latest` alias over a pinned version — Google rotates
+        # pinned model ids out from under you, and the alias doesn't break
+        # when that happens. Override via GEMINI_MODEL if needed.
+        self.model_name = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
         self._client = None
 
         if self.api_key:
@@ -82,5 +79,26 @@ class ModelAdapter:
                     f"[MODEL CALL FAILED — {type(exc).__name__}: {exc}. "
                     "No real triage/draft was produced for this note.]"
                 ),
+                mocked=True,
+            )
+
+    def transcribe(self, audio_bytes: bytes, mime_type: str = "audio/ogg") -> ModelResponse:
+        if not self._client:
+            return ModelResponse(
+                text="[MOCK MODE — no live GEMINI_API_KEY/model configured. Cannot transcribe.]",
+                mocked=True,
+            )
+        try:
+            response = self._client.generate_content(
+                [
+                    "Transcribe this voice note verbatim. Return only the transcript text, "
+                    "nothing else — no preamble, no quotes around it.",
+                    {"mime_type": mime_type, "data": audio_bytes},
+                ]
+            )
+            return ModelResponse(text=response.text.strip(), mocked=False)
+        except Exception as exc:
+            return ModelResponse(
+                text=f"[TRANSCRIPTION FAILED — {type(exc).__name__}: {exc}]",
                 mocked=True,
             )
