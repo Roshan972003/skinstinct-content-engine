@@ -9,6 +9,7 @@ def check() -> tuple[dict, int]:
             "TELEGRAM_BOT_TOKEN",
             "TELEGRAM_WEBHOOK_SECRET",
             "TELEGRAM_CHAT_ID",
+            "TELEGRAM_PUBLISHED_CHAT_ID",
             "SUPABASE_URL",
             "SUPABASE_SERVICE_ROLE_KEY",
             "GITHUB_TOKEN",

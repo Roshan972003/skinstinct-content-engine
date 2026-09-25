@@ -208,7 +208,8 @@ def finalize_decision(db: SupabaseClient, model: ModelAdapter, row: dict, action
         if message_id:
             edit_message_text(chat_id, message_id, f"{original_text}\n\n---\n✅ Approved & archived: {file_url}")
         final_copy = render_final_copy(row.get("draft_text") or "", bool(row.get("news_used")), news)
-        send_message(f"✅ Final copy — ready to post:\n\n{final_copy}", chat_id=chat_id)
+        published_chat_id = os.environ.get("TELEGRAM_PUBLISHED_CHAT_ID") or chat_id
+        send_message(final_copy, chat_id=published_chat_id)
         db.update("drafts", match={"id": row["id"]}, fields={"status": "approved", "decided_at": now, "archive_url": file_url})
         return "Approved & archived"
 
